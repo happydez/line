@@ -15,7 +15,6 @@ Convar gCV_DrawBackDefault = null;
 Convar gCV_DrawAheadDefault = null;
 Convar gCV_MaxDrawBack = null;
 Convar gCV_MaxDrawAhead = null;
-Convar gCV_BatchSize = null;
 Convar gCV_UpdateTimer = null;
 Convar gCV_BeamLife = null;
 Convar gCV_MaxRenderDist = null;
@@ -27,7 +26,8 @@ Convar gCV_PartialDashLength = null;
 Convar gCV_PartialGapLength = null;
 
 // Logic
-Handle gH_LineTimer[MAXPLAYERS+1];
+int gI_CycleFrame[MAXPLAYERS+1];
+int gI_DrawBudget[MAXPLAYERS+1];
 int gI_CurrentIndex[MAXPLAYERS+1];
 int gI_EndIndex[MAXPLAYERS+1];
 float gF_PrevPos[MAXPLAYERS+1][3];
@@ -183,9 +183,8 @@ public void OnPluginStart()
     gCV_DrawAheadDefault = new Convar("line_draw_ahead_default", "128", "Default number of frames rendered forward", 0, true, 0.0);
     gCV_MaxDrawBack = new Convar("line_max_draw_back", "48", "Maximum frames clients can draw backwards", 0, true, 0.0);
     gCV_MaxDrawAhead = new Convar("line_max_draw_ahead", "256", "Maximum frames clients can draw forward", 0, true, 0.0);
-    gCV_BatchSize = new Convar("line_batch_size", "4", "Batch size per server frame when rendering", 0, true, 0.0);
-    gCV_UpdateTimer = new Convar("line_update_timer", "0.5", "Render interval", 0, true, 0.0);
-    gCV_BeamLife = new Convar("line_beam_life", "0.8", "Beam life", 0, true, 0.0);
+    gCV_UpdateTimer = new Convar("line_update_timer", "0.8", "Render interval; the visible path is redrawn once per this interval, spread evenly across frames.", 0, true, 0.0);
+    gCV_BeamLife = new Convar("line_beam_life", "0.9", "Beam life", 0, true, 0.0);
     gCV_MaxRenderDist = new Convar("line_max_render_dist", "4096", "Maximum render distance in units\n-1.0 to disable", 0, true, -1.0);
     gCV_ZOffset = new Convar("line_z_offset", "2.5", "Z-axis offset for Z-Lerp interpolation", 0, true, 0.0);
     gCV_SkipFrames = new Convar("line_skip_frames", "20", "The number of frames to skip when loading a replay data", 0, true, 1.0);
@@ -230,13 +229,6 @@ public void OnConVarChanged(ConVar convar, const char[] oldValue, const char[] n
 public void OnPluginEnd()
 {
     UnpatchTELimit();
-    for (int i = 1; i <= MaxClients; i++)
-    {
-        if (IsClientInGame(i))
-        {
-            delete gH_LineTimer[i];
-        }
-    }
 }
 
 static void PatchTELimit(GameData gd)
@@ -298,14 +290,15 @@ public void OnMapStart()
 
 public void OnClientDisconnect(int client)
 {
-    delete gH_LineTimer[client];
     gB_ClientLineEnabled[client] = false;
+    gI_CycleFrame[client] = 0;
 }
 
 public void OnClientPutInServer(int client)
 {
     gI_LerpStartFrame[client] = -1;
     gI_LerpEndFrame[client] = -1;
+    gI_CycleFrame[client] = 0;
 
     if (AreClientCookiesCached(client))
     {
@@ -317,9 +310,6 @@ public void OnClientPutInServer(int client)
     }
 
     gI_ClientLineStyle[client] = NextStyleForLine(client, true);
-
-    delete gH_LineTimer[client];
-    gH_LineTimer[client] = CreateTimer(gCV_UpdateTimer.FloatValue, Timer_DrawLines, GetClientUserId(client), TIMER_REPEAT);
 }
 
 public void Shavit_OnReplaysLoaded()
@@ -501,20 +491,44 @@ bool LoadLineCfg()
     return true;
 }
 
-public Action Timer_DrawLines(Handle timer, int userid)
+public void OnGameFrame()
 {
-    int client = GetClientOfUserId(userid);
-    if (!IsValidClient(client) || !gB_ClientLineEnabled[client])
+    int framesPerCycle = RoundToCeil(gCV_UpdateTimer.FloatValue / GetTickInterval());
+    if (framesPerCycle < 1)
     {
-        return Plugin_Continue;
+        framesPerCycle = 1;
     }
+
+    for (int client = 1; client <= MaxClients; client++)
+    {
+        if (!gB_ClientLineEnabled[client] || !IsValidClient(client))
+        {
+            continue;
+        }
+
+        if (gI_CycleFrame[client] <= 0)
+        {
+            gI_CycleFrame[client] = framesPerCycle;
+            StartDrawCycle(client, framesPerCycle);
+        }
+
+        gI_CycleFrame[client]--;
+
+        DrawBatch(client);
+    }
+}
+
+void StartDrawCycle(int client, int framesPerCycle)
+{
+    gI_EndIndex[client] = 0;
+    gI_CurrentIndex[client] = 0;
 
     int style = gI_ClientLineStyle[client];
     int track = gI_ClientLineTrack[client];
     ArrayList list = gA_ReplayFrames[style][track];
     if (list == null || list.Length == 0)
     {
-        return Plugin_Continue;
+        return;
     }
 
     float clientPos[3];
@@ -610,20 +624,14 @@ public Action Timer_DrawLines(Handle timer, int userid)
     gI_CurrentIndex[client] = startIndex + 1;
     gI_EndIndex[client] = endIndex;
 
-    RequestFrame(Request_DrawBatch, userid);
-
-    return Plugin_Continue;
-}
-
-public void Request_DrawBatch(int userid)
-{
-    int client = GetClientOfUserId(userid);
-    if (!IsValidClient(client) || !gB_ClientLineEnabled[client])
+    int windowSize = gI_EndIndex[client] - gI_CurrentIndex[client];
+    int budget = (windowSize + framesPerCycle - 1) / framesPerCycle;
+    if (budget < 1)
     {
-        return;
+        budget = 1;
     }
 
-    DrawBatch(client);
+    gI_DrawBudget[client] = budget;
 }
 
 void DrawBatch(int client)
@@ -674,7 +682,7 @@ void DrawBatch(int client)
     float minFrameDist = gCV_MinFrameDistance.FloatValue;
 
     int i = gI_CurrentIndex[client];
-    int batchEnd = i + gCV_BatchSize.IntValue;
+    int batchEnd = i + gI_DrawBudget[client];
     if (batchEnd > gI_EndIndex[client])
     {
         batchEnd = gI_EndIndex[client];
@@ -828,11 +836,6 @@ void DrawBatch(int client)
     gF_LastLandPos[client] = lastLandPos;
     g_bHasLastLand[client] = hasLastLand;
     gI_CurrentIndex[client] = i;
-
-    if (i < gI_EndIndex[client] && i < len)
-    {
-        RequestFrame(Request_DrawBatch, GetClientUserId(client));
-    }
 }
 
 void ZLerp(int client, ArrayList list, int index, float pos[3])
