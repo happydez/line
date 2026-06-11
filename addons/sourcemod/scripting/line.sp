@@ -158,7 +158,7 @@ public Plugin myinfo =
     name = "[bhoptimer] line",
     author = "happydez",
     description = "✿˘✧.*☆*✲☆⋆❤˘━✧.*",
-    version = "2.1.0",
+    version = "2.2.0",
     url = "https://github.com/happydez/line"
 };
 
